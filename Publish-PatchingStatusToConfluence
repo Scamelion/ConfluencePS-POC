@@ -1,0 +1,229 @@
+<#
+SYNOPSIS
+    Publishes Windows server Patch status to Confluence page
+
+DESCRIPTION
+    Uses an Excel spreasheet attached to the Confluence to track changes or remediate
+    status information that cannot be retrieved due to unreachable servers. The spreadsheet
+    can be edited to add statuses that are missing.
+    
+NOTES
+    Author: Scott Lemonde
+#>
+
+import-module ConfluencePS
+
+$releaseDate = Get-Date -Date "9/26/2023"
+$Last4Cycles = @(
+    @{
+        'Quater'      = '2023Q2'
+        'ReleaseDate' = Get-Date '6/21/2023'
+    },
+    @{
+        'Quater'      = '2023Q1'
+        'ReleaseDate' = Get-Date '4/14/2023'
+    },
+    @{
+        "Quater"      = "2022Q4"
+        "ReleaseDate" = Get-Date "12/29/2022"
+    },
+    @{
+        "Quater"      = "2022Q3"
+        "ReleaseDate" = Get-Date "9/27/2022"
+    },
+    @{
+        "Quater"      = "2022Q2"
+        "ReleaseDate" = Get-Date "6/30/2022"
+    },
+    @{
+        "Quater"      = "2022Q1"
+        "ReleaseDate" = Get-Date "3/31/2022"
+    }
+)
+function Get-PatchStatus {
+    param (
+        # Date
+        [Parameter(Mandatory)]
+        [datetime]
+        $PatchDate
+    )
+
+    $patchStatusStr = "{status:colour=Green|title=Patched|subtle=false}"
+    $unpatchedStatusStr = "{status:colour=Red|title=Not Patched|subtle=false}"
+
+    if ($PatchDate -lt $releaseDate) {
+        return $unpatchedStatusStr
+    }
+    else {
+        return $patchStatusStr
+    }
+}
+
+Function Get-MissedCycles {
+    param (
+        # Date
+        [Parameter(Mandatory)]
+        [datetime]
+        $PatchDate
+    )
+
+    if ($PatchDate -lt $Last4Cycles[3].ReleaseDate) {
+        return "{status:colour=Red|title=4+|subtle=false}"
+    }
+    elseif ($PatchDate -lt $Last4Cycles[2].ReleaseDate) {
+        return "{status:colour=Yellow|title=3|subtle=false}"
+    }
+    elseif ($PatchDate -lt $Last4Cycles[1].ReleaseDate) {
+        return "{status:colour=Orange|title=2|subtle=true}"
+    }
+    elseif ($PatchDate -lt $Last4Cycles[0].ReleaseDate) {
+        return "{status:colour=Yellow|title=1|subtle=true}"
+    }
+    else {
+        return "{status:colour=Green|title=None|subtle=False}"
+    }
+}
+
+function Show-PatchAssignments {
+    $assignments | group-Object -Property Name | Select-Object -Property Name, Count
+}
+
+# Import Credential files
+$red = Import-Clixml .\cred.xml
+
+# Configure Confluence session
+Set-ConfluenceInfo -BaseURi "https://confluence.somesite.com/confluence" -Credential (Get-Credential -Credential $cred) | Out-Null
+$confPageId = 12345678
+
+# Get existing Conf. attachment
+$attachName = "PatchStatus.xlsx"
+$attachment = Get-ConfluenceAttachment $confPageId -FileNameFilter $attachName
+$attachment | Get-ConfluenceAttachmentFile -Path "$($env:TEMP)"
+$statusExcel = Import-Excel -Path "$($env:TEMP)\$confPageId_$($attachment.Filename)"
+
+$patchStatusStr = "{status:colour=Green|title=Patched|subtle=false}"
+$unpatchedStatusStr = "{status:colour=Red|title=Not Patched|subtle=false}"
+$unknownStatusStr = "{status:colour=Yellow|title=Unknown|subtle=false}"
+$noConnStatusStr = "{status:colour=Grey|title=No Connection|subtle=false}"
+$ureachableStatusStr = "{status:colour=red|title=Unreachable|subtle=true}"
+$availableStatusStr = "{status:colour=blue|title=Available|subtle=false}"
+
+$excludeServers = @(
+    "BADSERVER01",
+    "BADSERVER02",
+    "BADSERVER03"
+)
+
+$ExcelParams = @{
+    Path       = $env:TEMP + "\" + $attachName
+    Show       = $False
+    Verbose    = $true
+    AutoSize   = $true
+    AutoFilter = $true
+    KillExcel  = $true
+}
+
+# AD Filters
+$svrOS = '(OperatingSystem -like "*Server*") -and (Enabled -eq $true)'
+$win10Svrs = '(OperatingSystem -like "*Windows 10*") -and (Name -notlike "4D*")' 
+
+# Select servers that are enabled and not in the exemption list
+[System.Collections.ArrayList]$validServers = Get-ADComputer -filter $svrOS -Properties OperatingSystem, Enabled | Select-Object -Property @{Name = "ServerName"; expr = { $_.Name } }, OperatingSystem | Where-Object { $excludeServers -notcontains $_.ServerName }
+$validServers += Get-ADComputer -SearchBase "OU=Servers,DC=company,DC=com" -Filter $win10Svrs -Properties OperatingSystem, Enabled | Select-Object -Property @{Name = "ServerName"; expr = { $_.Name } }, OperatingSystem | Where-Object { $excludeServers -notcontains $_.ServerName }
+$validServers = $validServers | Sort-Object -Unique -Property ServerName
+
+$assignments = Import-Excel -Path ".\Patch Assignments.xlsx"
+
+Write-PSFMessage -Message "Processing servers..." -Level Important
+foreach ($server in $validServers) {
+    # Text if server is reachable
+    if (Test-Connection $server.ServerName -Quiet -TimeoutSeconds 15) {
+        Write-PSFMessage -Message "Connection made to $($server.ServerName)" -Level Host
+
+        # Get most recent installation date
+        $LastUpdated = invoke-command -ComputerName $server.ServerName { (Get-HotFix | Sort-Object -Property InstalledOn -Descending)[0].InstalledOn }
+
+        if ($null -ne $LastUpdated) {
+            $server | Add-Member -MemberType NoteProperty -Name "LastPatched" -Value $LastUpdated.ToShortDateString()
+            $server | Add-Member -MemberType NoteProperty -Name "PatchStatus" -Value (Get-PatchStatus -PatchDate $LastUpdated)
+            $server | Add-Member -MemberType NoteProperty -Name "MissedCycles" -Value (Get-MissedCycles -PatchDate $LastUpdated)
+            $server | Add-Member -MemberType NoteProperty -Name "ServerStatus" -Value $availableStatusStr
+        }
+        else {
+            $naSvr = $statusExcel | Where-Object { $_.ServerName -eq $server.ServerName }
+            Write-PSFMessage -Message "Cannot connect to $($server.ServerName)" -Level Error
+            if ($null -ne $naSvr) {
+                Write-PSFMessage -Message "$($server.ServerName) found in spreadsheet" -Level Error
+                $server | Add-Member -MemberType NoteProperty -Name "LastPatched" -Value $naSvr.LastPatched
+                $server | Add-Member -MemberType NoteProperty -Name "PatchStatus" -Value (Get-PatchStatus -PatchDate (Get-Date $naSvr.LastPatched))
+                $server | Add-Member -MemberType NoteProperty -Name "MissedCycles" -Value (Get-MissedCycles -PatchDate $naSvr.LastPatched)
+            }   
+            else {
+                Write-PSFMessage -Message "$($server.ServerName) NOT found in spreadsheet" -Level Error
+                $server | Add-Member -MemberType NoteProperty -Name "LastPatched" -Value $unknownStatusStr
+                $server | Add-Member -MemberType NoteProperty -Name "PatchStatus" -Value $unknownStatusStr
+                $server | Add-Member -MemberType NoteProperty -Name "MissedCycles" -Value $unknownStatusStr
+            }
+            $server | Add-Member -MemberType NoteProperty -Name "ServerStatus" -Value $noConnStatusStr
+        }
+    }
+    else {
+        Write-PSFMessage -Message "$($server.ServerName) is unreachable" -Level Error
+        $naSvr = $statusExcel | Where-Object { $_.ServerName -eq $server.ServerName }
+        if ($null -ne $naSvr) {
+            Write-PSFMessage -Message "$($server.ServerName) found in spreadsheet" -Level Error
+            $server | Add-Member -MemberType NoteProperty -Name "LastPatched" -Value $naSvr.LastPatched
+            
+            if ($naSvr.LastPatched -eq $unknownStatusStr) {
+                $server | Add-Member -MemberType NoteProperty -Name "PatchStatus" -Value $unknownStatusStr
+                $server | Add-Member -MemberType NoteProperty -Name "MissedCycles" -Value $unknownStatusStr
+            } else {
+                $server | Add-Member -MemberType NoteProperty -Name "PatchStatus" -Value (Get-PatchStatus -PatchDate $naSvr.LastPatched)
+                $server | Add-Member -MemberType NoteProperty -Name "MissedCycles" -Value (Get-MissedCycles -PatchDate $naSvr.LastPatched)
+            }
+        }
+        else {
+            Write-PSFMessage -Message "$($server.ServerName) NOT found in spreadsheet" -Level Error
+            $server | Add-Member -MemberType NoteProperty -Name "LastPatched" -Value $unknownStatusStr
+            $server | Add-Member -MemberType NoteProperty -Name "PatchStatus" -Value  $unknownStatusStr
+            $server | Add-Member -MemberType NoteProperty -Name "MissedCycles" -Value $unknownStatusStr
+        }
+        $server | Add-Member -MemberType NoteProperty -Name "ServerStatus" -Value $ureachableStatusStr
+    }
+    $server | Add-Member -MemberType NoteProperty -Name "AssignedTo" -Value ($assignments | Where-Object { $_.Server -eq $server.ServerName }).Name
+}
+
+Remove-Item -Path $ExcelParams.Path -Force -ErrorAction Ignore
+$validServers | Export-Excel @ExcelParams
+
+$patchedSvrs = $validServers | Where-Object { $_.PatchStatus -eq $patchStatusStr }
+$unpatchedSvrs = $validServers | Where-Object { $_.PatchStatus -eq $unpatchedStatusStr }
+$unknownPatchStatSvrs = $validServers | Where-Object { $_.PatchStatus -eq $unknownStatusStr }
+$noConnSvrs = $validServers | Where-Object { $_.ServerStatus -eq $noConnStatusStr }
+$unreachSvrs = $validServers | Where-Object { $_.ServerStatus -eq $ureachableStatusStr }
+$missed1cycleSvrs = $validServers | Where-Object { $_.MissedCycles -eq "{status:colour=Yellow|title=1|subtle=true}" }
+$missed2CycleSvrs = $validServers | Where-Object { $_.MissedCycles -eq "{status:colour=Orange|title=2|subtle=true}" }
+$missed3CycleSvrs = $validServers | Where-Object { $_.MissedCycles -eq "{status:colour=Yellow|title=3|subtle=false}" }
+$missed4CycleSvrs = $validServers | Where-Object { $_.MissedCycles -eq "{status:colour=Red|title=4+|subtle=false}" }
+
+$serverCounts = @{
+    "Patched Servers"      = $patchedSvrs.Count
+    "Unpatched Servers"    = $unpatchedSvrs.Count
+    "Unknown Patch Status" = $unknownPatchStatSvrs.Count
+    "No Connection"        = $noConnSvrs.Count
+    "Unreachable"          = $unreachSvrs.Count
+    "Missed 1 Cycle"       = $missed1cycleSvrs.Count
+    "Missed 2 Cycles"      = $missed2CycleSvrs.Count
+    "Missed 3 Cycles"      = $missed3CycleSvrs.Count
+    "Missed 4+ Cycles"     = $missed4CycleSvrs.Count
+}
+
+$releaseDateStr = "<h3><span style=`"color: rgb(255,0,0);`">Patch Release Date: $($releaseDate.ToShortDateString())</span></h3>"
+$infoMrkdwn = "{info:icon=true}*This page is automatically generated.*{info}"
+$markdownBody = ($serverCounts | Select-Object -Property "Patched Servers", "Unpatched Servers", "Unknown Patch Status", "No Connection", "Unreachable", "Missed 1 Cycle", "Missed 2 Cycles", "Missed 3 Cycles", "Missed 4+ Cycles" | ConvertTo-ConfluenceTable -Vertical) + "`n" + ($validServers | ConvertTo-ConfluenceTable) + "`n" + $infoMrkDwn
+Set-ConfluencePage -PageID $confPageId -Body ($releaseDateStr + ($markdownBody | ConvertTo-ConfluenceStorageFormat))
+
+Remove-Item -Path $ExcelParams.Path -Force -ErrorAction Ignore
+$validServers | Export-Excel @ExcelParams
+
+Set-ConfluenceAttachment -Attachment $attachment -FilePath $ExcelParams.Path
